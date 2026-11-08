@@ -1,0 +1,27 @@
+name: Build ESP32-S3 audio test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.2
+          target: esp32s3
+          command: idf.py build && idf.py merge-bin
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAX98357A-Audio-Test-ESP32-S3
+          path: build/merged-binary.bin
+          if-no-files-found: error
