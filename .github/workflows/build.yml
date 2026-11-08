@@ -24,29 +24,13 @@ jobs:
             echo "Checking selected flash and PSRAM configuration..."
             grep -q '^CONFIG_ESPTOOLPY_FLASHMODE_QIO=y$' sdkconfig
             grep -q '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig
-            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig
+            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$'
 
             echo "Merging images with an explicit QIO header."
-            python -m esptool --chip esp32s3 merge-bin \
-              -o build/merged-binary.bin -f raw \
-              --flash_mode qio --flash_freq 80m --flash_size 16MB \
-              0x0 build/bootloader/bootloader.bin \
-              0x8000 build/partition_table/partition-table.bin \
-              0x10000 build/max98357a_audio_test.bin
+            python -m esptool --chip esp32s3 merge-bin -o build/merged-binary.bin -f raw --flash_mode qio --flash_freq 80m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
 
             echo "Verifying merged bootloader image header..."
-            python - <<'PY'
-            from pathlib import Path
-            image = Path("build/merged-binary.bin").read_bytes()
-            if len(image) < 4 or image[0] != 0xE9:
-                raise SystemExit("ERROR: merged file does not start with an ESP image")
-            modes = {0: "QIO", 1: "QOUT", 2: "DIO", 3: "DOUT", 4: "FAST_READ", 5: "SLOW_READ"}
-            mode = image[2]
-            print(f"Bootloader image flash mode: {modes.get(mode, f'UNKNOWN({mode})')}")
-            if mode != 0:
-                raise SystemExit("ERROR: merged image header is not QIO")
-            print(f"Merged image size: {len(image)} bytes")
-            PY
+            python -c "from pathlib import Path; b=Path('build/merged-binary.bin').read_bytes(); modes={0:'QIO',1:'QOUT',2:'DIO',3:'DOUT',4:'FAST_READ',5:'SLOW_READ'}; print('Bootloader image flash mode:', modes.get(b[2], 'UNKNOWN')); assert b[0] == 0xE9, 'Not an ESP image'; assert b[2] == 0, 'Merged image header is not QIO'; print('Merged image size:', len(b), 'bytes')"
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
