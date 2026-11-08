@@ -12,12 +12,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build firmware
+      - name: Build and verify firmware configuration
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.3.2
           target: esp32s3
-          command: idf.py build && idf.py merge-bin
+          command: |
+            set -e
+            idf.py build
+            echo "Checking selected flash and PSRAM configuration..."
+            grep -q '^CONFIG_ESPTOOLPY_FLASHMODE_QIO=y$' sdkconfig
+            grep -q '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig
+            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig
+            echo "QIO selection and Octal PSRAM settings are enabled."
+            echo "Checking generated application image header..."
+            python -m esptool image_info build/max98357a_audio_test.bin
+            idf.py merge-bin
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
