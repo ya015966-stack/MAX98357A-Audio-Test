@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,19 +19,21 @@ jobs:
           esp_idf_version: v5.3.2
           target: esp32s3
           command: |
-            set -e
-            idf.py build
+            set -euo pipefail
+
+            echo "Building ESP32-S3 firmware (15-minute limit)..."
+            timeout --signal=TERM --kill-after=30s 15m idf.py build
 
             echo "Checking selected flash and PSRAM configuration..."
             grep -q '^CONFIG_ESPTOOLPY_FLASHMODE_QIO=y$' sdkconfig
             grep -q '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig
-            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$'
+            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig
 
             echo "Merging images with an explicit QIO header."
             python -m esptool --chip esp32s3 merge-bin -o build/merged-binary.bin -f raw --flash_mode qio --flash_freq 80m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
 
             echo "Verifying merged bootloader image header..."
-            python -c "from pathlib import Path; b=Path('build/merged-binary.bin').read_bytes(); modes={0:'QIO',1:'QOUT',2:'DIO',3:'DOUT',4:'FAST_READ',5:'SLOW_READ'}; print('Bootloader image flash mode:', modes.get(b[2], 'UNKNOWN')); assert b[0] == 0xE9, 'Not an ESP image'; assert b[2] == 0, 'Merged image header is not QIO'; print('Merged image size:', len(b), 'bytes')"
+            python -c "from pathlib import Path; p=Path('build/merged-binary.bin'); b=p.read_bytes(); modes={0:'QIO',1:'QOUT',2:'DIO',3:'DOUT',4:'FAST_READ',5:'SLOW_READ'}; assert len(b) >= 3, 'Merged image is too short'; print('Bootloader image flash mode:', modes.get(b[2], 'UNKNOWN')); assert b[0] == 0xE9, 'Not an ESP image'; assert b[2] == 0, 'Merged image header is not QIO'; print('Merged image size:', len(b), 'bytes')"
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
