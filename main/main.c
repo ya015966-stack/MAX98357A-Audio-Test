@@ -1,156 +1,190 @@
 #include <stdio.h>
 #include <stdint.h>
-#include <math.h>
+#include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_err.h"
+#include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "driver/gpio.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
 #include "driver/i2s_std.h"
 
 #define SAMPLE_RATE 16000
-#define AMP_BCLK GPIO_NUM_1
-#define AMP_LRCK GPIO_NUM_2
-#define AMP_DIN  GPIO_NUM_21
+#define MAX_SECONDS 10
+#define MAX_SAMPLES (SAMPLE_RATE * MAX_SECONDS)
 #define MIC_BCLK GPIO_NUM_38
-#define MIC_WS   GPIO_NUM_39
+#define MIC_WS GPIO_NUM_39
 #define MIC_DOUT GPIO_NUM_40
+#define AP_SSID "RAVA-AUDIO"
+#define AP_PASSWORD "ravaaudio"
 
-static i2s_chan_handle_t tx_handle = NULL;
-static i2s_chan_handle_t rx_handle = NULL;
+static const char *TAG = "RAVA_WAV";
+static i2s_chan_handle_t rx_handle;
+static int16_t *record_buffer;
+static volatile size_t recorded_samples;
+static volatile bool recording;
+static SemaphoreHandle_t record_lock;
 
-static esp_err_t init_speaker(void)
-{
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    esp_err_t err = i2s_new_channel(&chan_cfg, &tx_handle, NULL);
-    if (err != ESP_OK) return err;
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = AMP_BCLK,
-            .ws = AMP_LRCK,
-            .dout = AMP_DIN,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
-        }
-    };
-    err = i2s_channel_init_std_mode(tx_handle, &std_cfg);
-    if (err != ESP_OK) return err;
-    return i2s_channel_enable(tx_handle);
+static void put_u16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
+static void put_u32(uint8_t *p, uint32_t v) {
+    p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
+    p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
 }
 
-static void play_test_tone(void)
-{
-    int16_t samples[256];
-    const float two_pi = 6.28318530718f;
-    const int total_samples = SAMPLE_RATE / 2; // 0.5 second
-    int written_samples = 0;
-
-    while (written_samples < total_samples) {
-        int count = total_samples - written_samples;
-        if (count > 256) count = 256;
-
-        for (int i = 0; i < count; ++i) {
-            float phase = two_pi * 440.0f * (float)(written_samples + i) / SAMPLE_RATE;
-            samples[i] = (int16_t)(2500.0f * sinf(phase));
-        }
-
-        size_t bytes_written = 0;
-        esp_err_t err = i2s_channel_write(tx_handle, samples, count * sizeof(int16_t),
-                                          &bytes_written, portMAX_DELAY);
-        if (err != ESP_OK || bytes_written == 0) {
-            printf("SPEAKER_WRITE_ERROR: %s\n", esp_err_to_name(err));
-            return;
-        }
-        written_samples += bytes_written / sizeof(int16_t);
-    }
-    printf("SPEAKER_TONE_SENT\n");
+static void make_wav_header(uint8_t h[44], uint32_t data_size) {
+    memset(h, 0, 44);
+    memcpy(h, "RIFF", 4); put_u32(h + 4, 36 + data_size); memcpy(h + 8, "WAVE", 4);
+    memcpy(h + 12, "fmt ", 4); put_u32(h + 16, 16); put_u16(h + 20, 1);
+    put_u16(h + 22, 1); put_u32(h + 24, SAMPLE_RATE); put_u32(h + 28, SAMPLE_RATE * 2);
+    put_u16(h + 32, 2); put_u16(h + 34, 16);
+    memcpy(h + 36, "data", 4); put_u32(h + 40, data_size);
 }
 
-static esp_err_t init_microphone(void)
-{
+static esp_err_t init_microphone(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-    if (err != ESP_OK) return err;
-
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &rx_handle), TAG, "I2S channel");
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = MIC_BCLK,
-            .ws = MIC_WS,
-            .dout = I2S_GPIO_UNUSED,
-            .din = MIC_DOUT,
+            .mclk = I2S_GPIO_UNUSED, .bclk = MIC_BCLK, .ws = MIC_WS,
+            .dout = I2S_GPIO_UNUSED, .din = MIC_DOUT,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
         }
     };
-    err = i2s_channel_init_std_mode(rx_handle, &std_cfg);
-    if (err != ESP_OK) return err;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg), TAG, "I2S std mode");
     return i2s_channel_enable(rx_handle);
 }
 
-static void microphone_monitor(void)
-{
-    int32_t samples[512];
-    while (1) {
-        size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(rx_handle, samples, sizeof(samples),
-                                         &bytes_read, 1000);
-        if (err != ESP_OK) {
-            printf("MIC_READ_ERROR: %s\n", esp_err_to_name(err));
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
+static void recording_task(void *arg) {
+    int32_t raw[512];
+    while (recording && recorded_samples < MAX_SAMPLES) {
+        size_t bytes = 0;
+        esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(250));
+        if (err != ESP_OK || bytes == 0) continue;
+        size_t n = bytes / sizeof(int32_t);
+        if (n > MAX_SAMPLES - recorded_samples) n = MAX_SAMPLES - recorded_samples;
+        for (size_t i = 0; i < n; ++i) {
+            // INMP441: signed 24-bit audio is left-aligned in a 32-bit I2S slot.
+            record_buffer[recorded_samples + i] = (int16_t)(raw[i] >> 16);
         }
-
-        size_t count = bytes_read / sizeof(int32_t);
-        uint64_t sum_sq = 0;
-        for (size_t i = 0; i < count; ++i) {
-            int32_t value = samples[i] >> 8; // INMP441 24-bit sample in 32-bit slot
-            int64_t v = value;
-            sum_sq += (uint64_t)(v * v);
-        }
-
-        float rms = count ? sqrtf((float)sum_sq / (float)count) : 0.0f;
-        printf("MIC_RMS: %.1f | bytes: %u\n", rms, (unsigned)bytes_read);
+        recorded_samples += n;
     }
+    recording = false;
+    ESP_LOGI(TAG, "Recording complete: %u samples", (unsigned)recorded_samples);
+    vTaskDelete(NULL);
 }
 
-void app_main(void)
-{
-    printf("\n===============================\n");
-    printf("RAVA AUDIO DIAGNOSTIC\n");
-    printf("ESP32-S3 + MAX98357A + INMP441\n");
-    printf("===============================\n");
+static esp_err_t root_handler(httpd_req_t *req) {
+    const char page[] =
+        "<!doctype html><html lang='fa' dir='rtl'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta charset='utf-8'><title>RAVA Audio</title><body style='font:18px sans-serif;max-width:520px;margin:40px auto;padding:16px'>"
+        "<h2>ضبط صدای RAVA</h2><p>میکروفون INMP441 | حداکثر ۱۰ ثانیه</p>"
+        "<button style='padding:14px' onclick=\"fetch('/start',{method:'POST'}).then(r=>r.text()).then(alert)\">شروع ضبط</button> "
+        "<button style='padding:14px' onclick=\"fetch('/stop',{method:'POST'}).then(r=>r.text()).then(alert)\">توقف ضبط</button>"
+        "<p><a href='/download'>دریافت فایل WAV</a></p><p id='s'>برای ضبط، ابتدا شروع را بزنید.</p>"
+        "<script>setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>document.getElementById('s').innerText=t),1000)</script>"
+        "</body></html>";
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
 
-    printf("PSRAM: %u bytes\n", (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
-
-    printf("SPEAKER_INIT...\n");
-    esp_err_t err = init_speaker();
-    if (err == ESP_OK) {
-        printf("SPEAKER_INIT_OK\n");
-        play_test_tone();
-    } else {
-        printf("SPEAKER_INIT_FAIL: %s\n", esp_err_to_name(err));
+static esp_err_t start_handler(httpd_req_t *req) {
+    if (recording) return httpd_resp_sendstr(req, "ضبط در حال انجام است.");
+    if (xSemaphoreTake(record_lock, pdMS_TO_TICKS(100)) != pdTRUE)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Busy");
+    recorded_samples = 0;
+    recording = true;
+    xSemaphoreGive(record_lock);
+    if (xTaskCreate(recording_task, "rava_record", 4096, NULL, 5, NULL) != pdPASS) {
+        recording = false;
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Task create failed");
     }
+    return httpd_resp_sendstr(req, "ضبط شروع شد؛ حداکثر ۱۰ ثانیه.");
+}
 
-    if (tx_handle) {
-        i2s_channel_disable(tx_handle);
-        i2s_del_channel(tx_handle);
-        tx_handle = NULL;
+static esp_err_t stop_handler(httpd_req_t *req) {
+    recording = false;
+    return httpd_resp_sendstr(req, "درخواست توقف ثبت شد.");
+}
+
+static esp_err_t status_handler(httpd_req_t *req) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s | مدت: %.1f ثانیه | حجم صدا: %u بایت",
+             recording ? "در حال ضبط" : "آماده", (double)recorded_samples / SAMPLE_RATE,
+             (unsigned)(recorded_samples * sizeof(int16_t)));
+    return httpd_resp_sendstr(req, msg);
+}
+
+static esp_err_t download_handler(httpd_req_t *req) {
+    if (recording) return httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "ابتدا ضبط را متوقف کنید");
+    if (recorded_samples == 0) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "هنوز صدایی ضبط نشده است");
+    uint32_t data_size = (uint32_t)(recorded_samples * sizeof(int16_t));
+    uint8_t header[44];
+    make_wav_header(header, data_size);
+    httpd_resp_set_type(req, "audio/wav");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=rava-recording.wav");
+    ESP_RETURN_ON_ERROR(httpd_resp_send_chunk(req, (const char *)header, sizeof(header)), TAG, "WAV header");
+    esp_err_t err = httpd_resp_send_chunk(req, (const char *)record_buffer, data_size);
+    if (err != ESP_OK) return err;
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static void start_web_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    ESP_ERROR_CHECK(httpd_start(&server, &config));
+    httpd_uri_t root = { .uri="/", .method=HTTP_GET, .handler=root_handler };
+    httpd_uri_t start = { .uri="/start", .method=HTTP_POST, .handler=start_handler };
+    httpd_uri_t stop = { .uri="/stop", .method=HTTP_POST, .handler=stop_handler };
+    httpd_uri_t status = { .uri="/status", .method=HTTP_GET, .handler=status_handler };
+    httpd_uri_t download = { .uri="/download", .method=HTTP_GET, .handler=download_handler };
+    httpd_register_uri_handler(server, &root);
+    httpd_register_uri_handler(server, &start);
+    httpd_register_uri_handler(server, &stop);
+    httpd_register_uri_handler(server, &status);
+    httpd_register_uri_handler(server, &download);
+}
+
+static void start_wifi_ap(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_config_t ap = { .ap = {
+        .ssid = AP_SSID, .ssid_len = sizeof(AP_SSID) - 1,
+        .channel = 1, .password = AP_PASSWORD, .max_connection = 2,
+        .authmode = WIFI_AUTH_WPA2_PSK
+    }};
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "Wi-Fi AP ready: %s / 192.168.4.1", AP_SSID);
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "RAVA Wi-Fi WAV recorder starting");
+    esp_err_t nvs = nvs_flash_init();
+    if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs = nvs_flash_init();
     }
-
-    printf("MIC_INIT...\n");
-    err = init_microphone();
-    if (err == ESP_OK) {
-        printf("MIC_INIT_OK - speak or make a gentle sound near the mic\n");
-        microphone_monitor();
-    } else {
-        printf("MIC_INIT_FAIL: %s\n", esp_err_to_name(err));
+    ESP_ERROR_CHECK(nvs);
+    record_lock = xSemaphoreCreateMutex();
+    record_buffer = heap_caps_malloc(MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!record_buffer) record_buffer = heap_caps_malloc(MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT);
+    if (!record_buffer) ESP_LOGE(TAG, "Not enough memory for recording buffer");
+    else {
+        ESP_ERROR_CHECK(init_microphone());
+        start_wifi_ap();
+        start_web_server();
+        ESP_LOGI(TAG, "Connect phone to %s, then open http://192.168.4.1", AP_SSID);
     }
-
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
 }
