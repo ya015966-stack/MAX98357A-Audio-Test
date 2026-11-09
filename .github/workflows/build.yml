@@ -1,52 +1,36 @@
-name: Build ESP32-S3 audio test
+name: Build RAVA boot diagnostic
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches:
+      - "diagnostic/**"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build and verify firmware configuration
+      - uses: actions/checkout@v4
+      - name: Build diagnostic firmware
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.3.2
           target: esp32s3
           command: |
             set -euo pipefail
-
-            echo "Building ESP32-S3 firmware (15-minute limit)..."
-            timeout --signal=TERM --kill-after=30s 15m idf.py build
-
-            echo "Checking selected flash and PSRAM configuration..."
-            grep -q '^CONFIG_ESPTOOLPY_FLASHMODE_QIO=y$' sdkconfig
-            grep -q '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig
-            grep -q '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig
-
-            echo "Merging images with an explicit QIO header."
-            python -m esptool --chip esp32s3 merge_bin -o build/merged-binary.bin -f raw --flash_mode qio --flash_freq 80m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
-
-            echo "Verifying merged image header..."
+            idf.py build
+            python -m esptool --chip esp32s3 merge_bin -o build/RAVA_BOOT_DIAGNOSTIC.bin -f raw --flash_mode dio --flash_freq 40m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
             python - <<'PY'
             from pathlib import Path
-            p = Path("build/merged-binary.bin")
+            p = Path("build/RAVA_BOOT_DIAGNOSTIC.bin")
             b = p.read_bytes()
-            assert len(b) >= 3, "Merged image is too short"
             assert b[0] == 0xE9, "Not an ESP image"
-            print("Merged image flash mode byte:", b[2])
-            assert b[2] == 0, "Merged image header is not QIO"
-            print("Merged image size:", len(b), "bytes")
+            assert b[2] == 2, f"Expected DIO header, got {b[2]}"
+            print(f"Verified image: {len(b)} bytes; DIO header")
             PY
-
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: MAX98357A-Audio-Test-ESP32-S3
-          path: build/merged-binary.bin
+          name: RAVA-BOOT-DIAGNOSTIC
+          path: build/RAVA_BOOT_DIAGNOSTIC.bin
           if-no-files-found: error
