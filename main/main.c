@@ -125,7 +125,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t download_handler(httpd_req_t *req) {
-    if (recording) return httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "ابتدا ضبط را متوقف کنید");
+    if (recording) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ابتدا ضبط را متوقف کنید");
     if (recorded_samples == 0) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "هنوز صدایی ضبط نشده است");
     uint32_t data_size = (uint32_t)(recorded_samples * sizeof(int16_t));
     uint8_t header[44];
