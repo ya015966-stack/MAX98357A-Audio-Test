@@ -1,4 +1,5 @@
 name: Build RAVA audio diagnostic
+# Rebuild after final source review, including the PSRAM status include.
 
 on:
   workflow_dispatch:
