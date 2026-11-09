@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "driver/i2s_std.h"
+#include "esp_timer.h"
 
 #define SAMPLE_RATE 16000
 #define MAX_SECONDS 10
@@ -31,6 +32,7 @@ static i2s_chan_handle_t rx_handle;
 static int16_t *record_buffer;
 static volatile size_t recorded_samples;
 static volatile bool recording;
+static int64_t recording_started_us;
 static SemaphoreHandle_t record_lock;
 
 // Gentle DC/very-low-frequency rumble removal; Q15 coefficient ~= 0.995.
@@ -69,7 +71,7 @@ static esp_err_t init_microphone(void) {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         // INMP441 L/R is tied to GND: receive only the LEFT slot.
         // Keep a 32-bit slot; the microphone's 24-bit sample is MSB-aligned.
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED, .bclk = MIC_BCLK, .ws = MIC_WS,
             .dout = I2S_GPIO_UNUSED, .din = MIC_DOUT,
@@ -81,17 +83,19 @@ static esp_err_t init_microphone(void) {
 }
 
 static void recording_task(void *arg) {
-    // Mono RX: one 32-bit LEFT-slot sample per frame.
-    int32_t raw[256];
+    // Stereo RX: explicitly select the LEFT 32-bit slot (INMP441 L/R is tied to GND).
+    // Reading both slots avoids driver/mono-slot ambiguity; discard the right slot.
+    int32_t raw[512];
     size_t startup_frames_to_discard = 256; // discard 16 ms of I2S startup settling
     dc_prev_x = 0;
     dc_prev_y = 0;
     while (recording && recorded_samples < MAX_SAMPLES) {
+        if ((esp_timer_get_time() - recording_started_us) >= (int64_t)MAX_SECONDS * 1000000LL) break;
         size_t bytes = 0;
-        esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(250));
-        if (err != ESP_OK || bytes < sizeof(int32_t)) continue;
+        esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(100));
+        if (err != ESP_OK || bytes < 2 * sizeof(int32_t)) continue;
 
-        size_t frames = bytes / sizeof(int32_t);
+        size_t frames = bytes / (2 * sizeof(int32_t));
         size_t first_frame = 0;
         if (startup_frames_to_discard > 0) {
             size_t discard = frames < startup_frames_to_discard ? frames : startup_frames_to_discard;
@@ -105,7 +109,7 @@ static void recording_task(void *arg) {
         for (size_t i = 0; i < usable_frames; ++i) {
             // INMP441 transmits 24 valid bits in the 32-bit Philips slot.
             // Convert the most significant 16 bits to signed PCM16 for WAV.
-            int16_t pcm = (int16_t)(raw[first_frame + i] >> 16);
+            int16_t pcm = (int16_t)(raw[(first_frame + i) * 2] >> 16); // left slot only
             record_buffer[recorded_samples + i] = clean_sample(pcm);
         }
         recorded_samples += usable_frames;
@@ -134,6 +138,7 @@ static esp_err_t start_handler(httpd_req_t *req) {
     if (xSemaphoreTake(record_lock, pdMS_TO_TICKS(100)) != pdTRUE)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Busy");
     recorded_samples = 0;
+    recording_started_us = esp_timer_get_time();
     dc_prev_x = 0;
     dc_prev_y = 0;
     recording = true;
@@ -152,8 +157,11 @@ static esp_err_t stop_handler(httpd_req_t *req) {
 
 static esp_err_t status_handler(httpd_req_t *req) {
     char msg[96];
+    double elapsed = recording ? (double)(esp_timer_get_time() - recording_started_us) / 1000000.0
+                               : (double)recorded_samples / SAMPLE_RATE;
+    if (elapsed > MAX_SECONDS) elapsed = MAX_SECONDS;
     snprintf(msg, sizeof(msg), "%s | مدت: %.1f ثانیه | حجم صدا: %u بایت",
-             recording ? "در حال ضبط" : "آماده", (double)recorded_samples / SAMPLE_RATE,
+             recording ? "در حال ضبط" : "آماده", elapsed,
              (unsigned)(recorded_samples * sizeof(int16_t)));
     return httpd_resp_sendstr(req, msg);
 }
