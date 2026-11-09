@@ -120,8 +120,8 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "<!doctype html><html lang='fa' dir='rtl'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<meta charset='utf-8'><title>RAVA Audio</title><body style='font:18px sans-serif;max-width:520px;margin:40px auto;padding:16px'>"
         "<h2>ضبط صدای RAVA</h2><p>میکروفون INMP441 | حداکثر ۱۰ ثانیه</p>"
-        "<button style='padding:14px' onclick=\\"fetch('/start',{method:'POST'}).then(r=>r.text()).then(alert)\\">شروع ضبط</button> "
-        "<button style='padding:14px' onclick=\\"fetch('/stop',{method:'POST'}).then(r=>r.text()).then(alert)\\">توقف ضبط</button>"
+        "<button style='padding:14px' onclick='fetch("/start",{method:"POST"}).then(r=>r.text()).then(alert)'>شروع ضبط</button> "
+        "<button style='padding:14px' onclick='fetch("/stop",{method:"POST"}).then(r=>r.text()).then(alert)'>توقف ضبط</button>"
         "<p><a href='/download'>دریافت فایل WAV</a></p><p id='s'>برای ضبط، ابتدا شروع را بزنید.</p>"
         "<script>setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>document.getElementById('s').innerText=t),1000)</script>"
         "</body></html>";
