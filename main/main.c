@@ -51,32 +51,40 @@ static void make_wav_header(uint8_t h[44], uint32_t data_size) {
 static esp_err_t init_microphone(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &rx_handle), TAG, "I2S channel");
+
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        // INMP441 drives one slot only. Read both slots and keep LEFT (L/R pin = GND).
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED, .bclk = MIC_BCLK, .ws = MIC_WS,
             .dout = I2S_GPIO_UNUSED, .din = MIC_DOUT,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
         }
     };
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg), TAG, "I2S std mode");
     return i2s_channel_enable(rx_handle);
 }
 
 static void recording_task(void *arg) {
+    // 256 stereo frames per read: left and right 32-bit slots.
     int32_t raw[512];
     while (recording && recorded_samples < MAX_SAMPLES) {
         size_t bytes = 0;
         esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(250));
-        if (err != ESP_OK || bytes == 0) continue;
-        size_t n = bytes / sizeof(int32_t);
-        if (n > MAX_SAMPLES - recorded_samples) n = MAX_SAMPLES - recorded_samples;
-        for (size_t i = 0; i < n; ++i) {
-            // INMP441: signed 24-bit audio is left-aligned in a 32-bit I2S slot.
-            record_buffer[recorded_samples + i] = (int16_t)(raw[i] >> 16);
+        if (err != ESP_OK || bytes < 2 * sizeof(int32_t)) continue;
+
+        size_t frames = bytes / (2 * sizeof(int32_t));
+        size_t remaining = MAX_SAMPLES - recorded_samples;
+        if (frames > remaining) frames = remaining;
+
+        for (size_t i = 0; i < frames; ++i) {
+            // L/R is tied to GND, so the microphone transmits in the LEFT slot.
+            // INMP441's signed 24-bit sample is left-aligned in the 32-bit slot.
+            record_buffer[recorded_samples + i] = (int16_t)(raw[2 * i] >> 16);
         }
-        recorded_samples += n;
+        recorded_samples += frames;
     }
     recording = false;
     ESP_LOGI(TAG, "Recording complete: %u samples", (unsigned)recorded_samples);
@@ -179,14 +187,21 @@ void app_main(void) {
         nvs = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs);
+
     record_lock = xSemaphoreCreateMutex();
+    if (!record_lock) {
+        ESP_LOGE(TAG, "Cannot create recording mutex");
+        return;
+    }
     record_buffer = heap_caps_malloc(MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!record_buffer) record_buffer = heap_caps_malloc(MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT);
-    if (!record_buffer) ESP_LOGE(TAG, "Not enough memory for recording buffer");
-    else {
-        ESP_ERROR_CHECK(init_microphone());
-        start_wifi_ap();
-        start_web_server();
-        ESP_LOGI(TAG, "Connect phone to %s, then open http://192.168.4.1", AP_SSID);
+    if (!record_buffer) {
+        ESP_LOGE(TAG, "Not enough memory for recording buffer");
+        return;
     }
+
+    ESP_ERROR_CHECK(init_microphone());
+    start_wifi_ap();
+    start_web_server();
+    ESP_LOGI(TAG, "Connect phone to %s, then open http://192.168.4.1", AP_SSID);
 }
