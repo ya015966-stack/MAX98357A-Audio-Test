@@ -1,4 +1,4 @@
-name: Build RAVA PSRAM diagnostic
+name: Build RAVA audio diagnostic
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build diagnostic firmware
+      - name: Build audio diagnostic firmware
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.3.2
@@ -20,10 +20,10 @@ jobs:
           command: |
             set -euo pipefail
             idf.py build
-            python -m esptool --chip esp32s3 merge_bin -o build/RAVA_PSRAM_DIAGNOSTIC.bin -f raw --flash_mode dio --flash_freq 40m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
+            python -m esptool --chip esp32s3 merge_bin -o build/RAVA_AUDIO_DIAGNOSTIC.bin -f raw --flash_mode dio --flash_freq 40m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
             python - <<'PY'
             from pathlib import Path
-            p = Path("build/RAVA_PSRAM_DIAGNOSTIC.bin")
+            p = Path("build/RAVA_AUDIO_DIAGNOSTIC.bin")
             b = p.read_bytes()
             assert b[0] == 0xE9, "Not an ESP image"
             assert b[2] == 2, f"Expected DIO header, got {b[2]}"
@@ -31,6 +31,6 @@ jobs:
             PY
       - uses: actions/upload-artifact@v4
         with:
-          name: RAVA-PSRAM-DIAGNOSTIC
-          path: build/RAVA_PSRAM_DIAGNOSTIC.bin
+          name: RAVA-AUDIO-DIAGNOSTIC
+          path: build/RAVA_AUDIO_DIAGNOSTIC.bin
           if-no-files-found: error
