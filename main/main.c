@@ -67,31 +67,31 @@ static esp_err_t init_microphone(void) {
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        // INMP441 drives one slot only. Read both slots and keep LEFT (L/R pin = GND).
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        // INMP441 L/R is tied to GND: receive only the LEFT slot.
+        // Keep a 32-bit slot; the microphone's 24-bit sample is MSB-aligned.
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED, .bclk = MIC_BCLK, .ws = MIC_WS,
             .dout = I2S_GPIO_UNUSED, .din = MIC_DOUT,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
         }
     };
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg), TAG, "I2S std mode");
     return i2s_channel_enable(rx_handle);
 }
 
 static void recording_task(void *arg) {
-    // 256 stereo frames per read: left and right 32-bit slots.
-    int32_t raw[512];
+    // Mono RX: one 32-bit LEFT-slot sample per frame.
+    int32_t raw[256];
     size_t startup_frames_to_discard = 256; // discard 16 ms of I2S startup settling
     dc_prev_x = 0;
     dc_prev_y = 0;
     while (recording && recorded_samples < MAX_SAMPLES) {
         size_t bytes = 0;
         esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(250));
-        if (err != ESP_OK || bytes < 2 * sizeof(int32_t)) continue;
+        if (err != ESP_OK || bytes < sizeof(int32_t)) continue;
 
-        size_t frames = bytes / (2 * sizeof(int32_t));
+        size_t frames = bytes / sizeof(int32_t);
         size_t first_frame = 0;
         if (startup_frames_to_discard > 0) {
             size_t discard = frames < startup_frames_to_discard ? frames : startup_frames_to_discard;
@@ -103,9 +103,9 @@ static void recording_task(void *arg) {
         if (usable_frames > remaining) usable_frames = remaining;
 
         for (size_t i = 0; i < usable_frames; ++i) {
-            // L/R is tied to GND: LEFT slot. INMP441 24-bit data is
-            // left-aligned in the 32-bit I2S slot; keep its upper 16 bits.
-            int16_t pcm = (int16_t)(raw[2 * (first_frame + i)] >> 16);
+            // INMP441 transmits 24 valid bits in the 32-bit Philips slot.
+            // Convert the most significant 16 bits to signed PCM16 for WAV.
+            int16_t pcm = (int16_t)(raw[first_frame + i] >> 16);
             record_buffer[recorded_samples + i] = clean_sample(pcm);
         }
         recorded_samples += usable_frames;
@@ -120,8 +120,8 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "<!doctype html><html lang='fa' dir='rtl'><meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<meta charset='utf-8'><title>RAVA Audio</title><body style='font:18px sans-serif;max-width:520px;margin:40px auto;padding:16px'>"
         "<h2>ضبط صدای RAVA</h2><p>میکروفون INMP441 | حداکثر ۱۰ ثانیه</p>"
-        "<button style='padding:14px' onclick=\"fetch('/start',{method:'POST'}).then(r=>r.text()).then(alert)\">شروع ضبط</button> "
-        "<button style='padding:14px' onclick=\"fetch('/stop',{method:'POST'}).then(r=>r.text()).then(alert)\">توقف ضبط</button>"
+        "<button style='padding:14px' onclick=\\"fetch('/start',{method:'POST'}).then(r=>r.text()).then(alert)\\">شروع ضبط</button> "
+        "<button style='padding:14px' onclick=\\"fetch('/stop',{method:'POST'}).then(r=>r.text()).then(alert)\\">توقف ضبط</button>"
         "<p><a href='/download'>دریافت فایل WAV</a></p><p id='s'>برای ضبط، ابتدا شروع را بزنید.</p>"
         "<script>setInterval(()=>fetch('/status').then(r=>r.text()).then(t=>document.getElementById('s').innerText=t),1000)</script>"
         "</body></html>";
