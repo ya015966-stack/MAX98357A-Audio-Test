@@ -1,11 +1,11 @@
-name: Build RAVA audio diagnostic
-# Rebuild after final source review, including the PSRAM status include.
+name: Build RAVA Wi-Fi WAV recorder
 
 on:
   workflow_dispatch:
   push:
     branches:
       - "diagnostic/**"
+      - "feature/rava-wifi-wav-recorder"
 
 jobs:
   build:
@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build audio diagnostic firmware
+      - name: Build Wi-Fi WAV recorder firmware
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.3.2
@@ -21,10 +21,10 @@ jobs:
           command: |
             set -euo pipefail
             idf.py build
-            python -m esptool --chip esp32s3 merge_bin -o build/RAVA_AUDIO_DIAGNOSTIC.bin -f raw --flash_mode dio --flash_freq 40m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
+            python -m esptool --chip esp32s3 merge_bin -o build/RAVA_WIFI_WAV_RECORDER.bin -f raw --flash_mode dio --flash_freq 40m --flash_size 16MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/max98357a_audio_test.bin
             python - <<'PY'
             from pathlib import Path
-            p = Path("build/RAVA_AUDIO_DIAGNOSTIC.bin")
+            p = Path("build/RAVA_WIFI_WAV_RECORDER.bin")
             b = p.read_bytes()
             assert b[0] == 0xE9, "Not an ESP image"
             assert b[2] == 2, f"Expected DIO header, got {b[2]}"
@@ -32,6 +32,6 @@ jobs:
             PY
       - uses: actions/upload-artifact@v4
         with:
-          name: RAVA-AUDIO-DIAGNOSTIC
-          path: build/RAVA_AUDIO_DIAGNOSTIC.bin
+          name: RAVA-WIFI-WAV-RECORDER
+          path: build/RAVA_WIFI_WAV_RECORDER.bin
           if-no-files-found: error
