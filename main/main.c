@@ -33,6 +33,19 @@ static volatile size_t recorded_samples;
 static volatile bool recording;
 static SemaphoreHandle_t record_lock;
 
+// Gentle DC/very-low-frequency rumble removal; Q15 coefficient ~= 0.995.
+static int32_t dc_prev_x;
+static int32_t dc_prev_y;
+static inline int16_t clean_sample(int16_t input) {
+    int32_t x = input;
+    int32_t y = x - dc_prev_x + ((32604 * dc_prev_y) >> 15);
+    dc_prev_x = x;
+    if (y > 32767) y = 32767;
+    if (y < -32768) y = -32768;
+    dc_prev_y = y;
+    return (int16_t)y;
+}
+
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
 static void put_u32(uint8_t *p, uint32_t v) {
     p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
@@ -70,21 +83,32 @@ static esp_err_t init_microphone(void) {
 static void recording_task(void *arg) {
     // 256 stereo frames per read: left and right 32-bit slots.
     int32_t raw[512];
+    size_t startup_frames_to_discard = 256; // discard 16 ms of I2S startup settling
+    dc_prev_x = 0;
+    dc_prev_y = 0;
     while (recording && recorded_samples < MAX_SAMPLES) {
         size_t bytes = 0;
         esp_err_t err = i2s_channel_read(rx_handle, raw, sizeof(raw), &bytes, pdMS_TO_TICKS(250));
         if (err != ESP_OK || bytes < 2 * sizeof(int32_t)) continue;
 
         size_t frames = bytes / (2 * sizeof(int32_t));
-        size_t remaining = MAX_SAMPLES - recorded_samples;
-        if (frames > remaining) frames = remaining;
-
-        for (size_t i = 0; i < frames; ++i) {
-            // L/R is tied to GND, so the microphone transmits in the LEFT slot.
-            // INMP441's signed 24-bit sample is left-aligned in the 32-bit slot.
-            record_buffer[recorded_samples + i] = (int16_t)(raw[2 * i] >> 16);
+        size_t first_frame = 0;
+        if (startup_frames_to_discard > 0) {
+            size_t discard = frames < startup_frames_to_discard ? frames : startup_frames_to_discard;
+            startup_frames_to_discard -= discard;
+            first_frame += discard;
         }
-        recorded_samples += frames;
+        size_t usable_frames = frames - first_frame;
+        size_t remaining = MAX_SAMPLES - recorded_samples;
+        if (usable_frames > remaining) usable_frames = remaining;
+
+        for (size_t i = 0; i < usable_frames; ++i) {
+            // L/R is tied to GND: LEFT slot. INMP441 24-bit data is
+            // left-aligned in the 32-bit I2S slot; keep its upper 16 bits.
+            int16_t pcm = (int16_t)(raw[2 * (first_frame + i)] >> 16);
+            record_buffer[recorded_samples + i] = clean_sample(pcm);
+        }
+        recorded_samples += usable_frames;
     }
     recording = false;
     ESP_LOGI(TAG, "Recording complete: %u samples", (unsigned)recorded_samples);
@@ -110,6 +134,8 @@ static esp_err_t start_handler(httpd_req_t *req) {
     if (xSemaphoreTake(record_lock, pdMS_TO_TICKS(100)) != pdTRUE)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Busy");
     recorded_samples = 0;
+    dc_prev_x = 0;
+    dc_prev_y = 0;
     recording = true;
     xSemaphoreGive(record_lock);
     if (xTaskCreate(recording_task, "rava_record", 4096, NULL, 5, NULL) != pdPASS) {
